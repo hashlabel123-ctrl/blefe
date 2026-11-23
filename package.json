@@ -1,0 +1,6 @@
+{
+  "name": "blefe",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" }
+}

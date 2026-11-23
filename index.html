@@ -1,0 +1,1279 @@
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px/1.4 system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style><script>/* Blefe fora do Claude: liga o jogo a /api/db (Vercel + Upstash Redis, ou servidor.py na rede local).
+   Imita a interface claude.use("db") / claude.use("user") que o jogo já usa. */
+(function () {
+  var slot = new URLSearchParams(location.search).get("p") || "";
+  var uid = null;
+  try { uid = localStorage.getItem("blefe.uid" + slot); } catch (e) {}
+  if (!uid) {
+    uid = "u_" + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 10);
+    try { localStorage.setItem("blefe.uid" + slot, uid); } catch (e) {}
+  }
+  if (slot) { // ?p=1, ?p=2: vários jogadores no mesmo navegador, para testar
+    try {
+      var keys = { "blefe.mesa": 1, "blefe.nick": 1 }, P = Storage.prototype, g = P.getItem, s = P.setItem, r = P.removeItem;
+      P.getItem = function (k) { return g.call(this, keys[k] ? k + slot : k); };
+      P.setItem = function (k, v) { return s.call(this, keys[k] ? k + slot : k, v); };
+      P.removeItem = function (k) { return r.call(this, keys[k] ? k + slot : k); };
+    } catch (e) {}
+  }
+  var POLL_MS = 1000;
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  function call(op, body) {
+    return fetch("/api/db?op=" + op, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), cache: "no-store" })
+      .then(function (r) { return r.json().catch(function () { return { error: "unavailable" }; }); },
+            function () { return { error: "unavailable" }; })
+      .then(function (j) { if (j && j.error) { if (j.message) console.warn("[blefe]", j.message); throw { code: j.error, message: j.message || j.error }; } return j; });
+  }
+  function snap(path, r) {
+    var d = r.data;
+    return { id: path.split("/").pop(), exists: !!d, data: function () { return d ? JSON.parse(JSON.stringify(d)) : undefined; }, metadata: { fromCache: false, hasPendingWrites: false } };
+  }
+  function ref(path) {
+    return {
+      path: path, id: path.split("/").pop(),
+      get: function () { return call("get", { path: path }).then(function (r) { return snap(path, r); }); },
+      set: function (d) { return call("set", { path: path, data: d }).then(function () {}); },
+      update: function (d) { return call("update", { path: path, data: d }).then(function () {}); },
+      delete: function () { return call("delete", { path: path }).then(function () {}); },
+      acquire: function (o) { return call("acquire", { path: path, holder: o.holder, ttlMs: o.ttlMs || 30000 }); },
+      onSnapshot: function (next) {
+        var stop = false, v = -1, kick = null;
+        function wait(ms) { return new Promise(function (res) { var t = setTimeout(res, ms); kick = function () { clearTimeout(t); res(); }; }); }
+        (async function loop() {
+          while (!stop) {
+            if (document.hidden) { await wait(5000); continue; }
+            try {
+              var r = await call("watch", { path: path, since: v });
+              if (stop) break;
+              if (!r.same && r.v !== v) { v = r.v; next(snap(path, r)); continue; }
+              if (r.same) await wait(POLL_MS);
+            } catch (e) { await wait(2000); }
+          }
+        })();
+        document.addEventListener("visibilitychange", function () { if (!document.hidden && kick) kick(); });
+        // depois de uma escrita própria, busca na hora em vez de esperar o próximo ciclo
+        window.addEventListener("blefe:wrote", function () { if (kick) kick(); });
+        return function () { stop = true; if (kick) kick(); };
+      }
+    };
+  }
+  var db = {
+    doc: function (p) {
+      var r0 = ref(p), set0 = r0.set, upd0 = r0.update;
+      r0.set = function (d) { return set0(d).then(function () { window.dispatchEvent(new Event("blefe:wrote")); }); };
+      r0.update = function (d) { return upd0(d).then(function () { window.dispatchEvent(new Event("blefe:wrote")); }); };
+      return r0;
+    }
+  };
+  var user = {
+    id: function () { return Promise.resolve(uid); },
+    can: function () { return Promise.resolve(true); },
+    isOwner: function () { return Promise.resolve(false); },
+    canEdit: function () { return Promise.resolve(false); }
+  };
+  window.claude = { use: function (n) { return Promise.resolve(n === "db" ? db : n === "user" ? user : null); } };
+})();
+</script></head><body><title>Blefe Impulso</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="theme-color" content="#0E1A26">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@400;500;600&family=Marcellus&display=swap">
+<style>
+/* Layout: uma coluna de mesa (máx. 480px). Mesa → palco do lance → sua mão → ações → histórico. Escuro por escolha (marca Impulso). */
+:root {
+  --bg: #0E1A26; --bg-2: #142434; --surf: #1B2F42; --surf-2: #233B53;
+  --line: rgba(232,239,245,.09); --line-2: rgba(232,239,245,.17);
+  --fg: #E8EFF5; --mute: rgba(232,239,245,.64); --faint: rgba(232,239,245,.40);
+  --gold: #C8B078; --gold-2: #E8D9B2; --bad: #DB8890; --good: #8ACBB2;
+  --display: "Marcellus", "Cinzel", "Trajan Pro", Georgia, serif;
+  --body: "Jost", "Avenir Next", ui-sans-serif, system-ui, sans-serif;
+  --ease: cubic-bezier(.2,.7,.2,1); --ease-io: cubic-bezier(.65,0,.35,1); --spring: cubic-bezier(.34,1.4,.5,1);
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html, body { background: var(--bg); color: var(--fg); }
+body { font-family: var(--body); font-size: 15px; line-height: 1.45; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; min-height: 100%; overflow-x: hidden; }
+.atmo { position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background: radial-gradient(130% 55% at 50% -12%, #22405C 0%, rgba(20,36,52,0) 62%),
+              radial-gradient(90% 40% at 50% 112%, rgba(200,176,120,.07), transparent 70%), var(--bg); }
+.atmo img { position: absolute; width: 150vw; max-width: 900px; left: 50%; top: 34%; transform: translate(-50%,-50%); opacity: .025; }
+#app { position: relative; z-index: 1; }
+.wrap { max-width: 480px; margin: 0 auto; padding-block: 18px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 18px; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+button:focus-visible, input:focus-visible, [tabindex]:focus-visible { outline: 1.5px solid var(--gold); outline-offset: 3px; }
+button:disabled { cursor: default; }
+.eyebrow { font-size: 11px; letter-spacing: .22em; text-transform: uppercase; color: var(--gold); font-weight: 500; }
+.display { font-family: var(--display); font-weight: 400; letter-spacing: .04em; text-wrap: balance; }
+.mute { color: var(--mute); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---------- botões ---------- */
+.btn { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 52px; padding: 0 20px; border-radius: 14px;
+  font-weight: 500; letter-spacing: .02em; font-size: 15.5px; transition: transform .18s var(--ease), background .25s ease, border-color .25s ease, opacity .25s ease; width: 100%; }
+.btn:active:not(:disabled) { transform: scale(.975); }
+.btn-primary { background: var(--fg); color: #0E1A26; box-shadow: 0 10px 30px -14px rgba(232,239,245,.55); }
+.btn-ghost { border: 1px solid var(--line-2); color: var(--fg); background: rgba(232,239,245,.03); }
+.btn-ghost:hover:not(:disabled) { border-color: rgba(232,239,245,.32); }
+.btn-bad { border: 1px solid color-mix(in srgb, var(--bad) 60%, transparent); color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+.btn-role { border: 1px solid color-mix(in srgb, var(--rc) 55%, transparent); color: var(--fg); background: color-mix(in srgb, var(--rc) 9%, transparent); }
+.btn-role .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--rc); box-shadow: 0 0 10px var(--rc); }
+.btn:disabled { opacity: .38; }
+.btn-text { color: var(--mute); font-size: 14px; padding: 10px; text-decoration: underline; text-underline-offset: 4px; text-decoration-color: var(--line-2); }
+.btn-row { display: grid; gap: 10px; }
+
+/* ---------- cartas ---------- */
+.card { --rc: var(--gold); position: relative; aspect-ratio: 5 / 7; width: 100%; max-width: 100%; border-radius: 13px; overflow: hidden;
+  background: linear-gradient(165deg, #243F59 0%, #172C40 50%, #0F1F2E 100%);
+  border: 1px solid var(--line-2); box-shadow: 0 18px 40px -18px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.06);
+  display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 13% 9% 11%; text-align: center; }
+.card::before { content: ""; position: absolute; inset: 6px; border: 1px solid color-mix(in srgb, var(--rc) 30%, transparent); border-radius: 9px; pointer-events: none; }
+.card::after { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(115deg, transparent 30%, rgba(255,255,255,.07) 45%, transparent 60%); background-size: 250% 100%; background-position: 100% 0; transition: background-position 1.2s var(--ease); }
+.card:hover::after { background-position: -50% 0; }
+.card-ico { width: 50%; color: var(--rc); filter: drop-shadow(0 0 16px color-mix(in srgb, var(--rc) 35%, transparent)); }
+.card-ico svg { display: block; width: 100%; height: auto; }
+.card-name { font-family: var(--display); letter-spacing: .16em; text-transform: uppercase; font-size: clamp(12px, 3.6vw, 15px); }
+.card-txt { font-size: 11.5px; color: var(--mute); line-height: 1.35; display: grid; gap: 4px; }
+.card-txt b { color: var(--fg); font-weight: 500; }
+.card.back { justify-content: center; background:
+  repeating-linear-gradient(45deg, rgba(200,176,120,.045) 0 1px, transparent 1px 10px),
+  repeating-linear-gradient(-45deg, rgba(200,176,120,.045) 0 1px, transparent 1px 10px),
+  radial-gradient(70% 50% at 50% 50%, #22405C, #0F1E2C); }
+.card.back img { width: 62%; opacity: .62; }
+.card.dead { filter: grayscale(.9) brightness(.55); }
+.card.dead .stamp { filter: none; }
+.stamp { position: absolute; top: 42%; left: 50%; transform: translate(-50%,-50%) rotate(-14deg); border: 1.5px solid var(--bad); color: var(--bad);
+  font-family: var(--display); letter-spacing: .22em; padding: 3px 12px 2px; font-size: 13px; text-transform: uppercase; border-radius: 5px; background: rgba(14,26,38,.7); }
+.card.selectable { cursor: pointer; transition: transform .3s var(--ease), box-shadow .3s var(--ease); }
+.card.selectable:active { transform: scale(.97); }
+.card.sel { transform: translateY(-10px); box-shadow: 0 0 0 1.5px var(--gold), 0 24px 40px -16px rgba(200,176,120,.35); }
+.card.sel::before { border-color: var(--gold); }
+.mini { width: 26px; height: 36px; border-radius: 5px; overflow: hidden; display: grid; place-items: center; border: 1px solid var(--line-2);
+  background: radial-gradient(80% 60% at 50% 50%, #22405C, #0F1E2C); }
+.mini img { width: 80%; opacity: .5; }
+.mini.dead { background: #142434; color: var(--rc); border-color: color-mix(in srgb, var(--rc) 40%, transparent); }
+.mini.dead svg { width: 70%; opacity: .7; }
+
+@keyframes flipIn { 0% { transform: perspective(700px) rotateY(95deg) scale(.94); filter: brightness(1.8); } 100% { transform: none; } }
+@keyframes deal { from { opacity: 0; transform: translateY(60px) rotate(-8deg) scale(.88); filter: blur(8px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes rise { from { opacity: 0; transform: translateY(16px); filter: blur(8px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes coinUp { 0% { opacity: 0; transform: translate(-50%, 6px) scale(.8); } 18% { opacity: 1; transform: translate(-50%, -4px) scale(1.05); } 100% { opacity: 0; transform: translate(-50%, -30px); } }
+@keyframes pop { 0% { transform: scale(1); } 35% { transform: scale(1.28); color: var(--gold-2); } 100% { transform: scale(1); } }
+@keyframes breathe { 0%,100% { box-shadow: 0 0 0 1px rgba(200,176,120,.38), 0 0 0 0 rgba(200,176,120,0); } 50% { box-shadow: 0 0 0 1px rgba(200,176,120,.7), 0 0 28px -6px rgba(200,176,120,.35); } }
+@keyframes float { 0%,100% { transform: translateY(0) rotate(var(--r)); } 50% { transform: translateY(-7px) rotate(var(--r)); } }
+@keyframes pulseDot { 0%,100% { opacity: .35; transform: scale(.8); } 50% { opacity: 1; transform: scale(1); } }
+@keyframes shake { 0%,100% { transform: translateX(0); } 20% { transform: translateX(-7px) rotate(-1.5deg); } 40% { transform: translateX(6px) rotate(1deg); } 60% { transform: translateX(-4px); } 80% { transform: translateX(3px); } }
+@keyframes stampIn { 0% { opacity: 0; transform: translate(-50%,-50%) rotate(-14deg) scale(2.2); } 60% { opacity: 1; transform: translate(-50%,-50%) rotate(-14deg) scale(.94); } 100% { opacity: 1; transform: translate(-50%,-50%) rotate(-14deg) scale(1); } }
+@keyframes sweep { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.fx-flip { animation: flipIn .75s var(--ease) both; }
+.fx-deal { animation: deal .9s var(--ease) both; }
+.fx-rise { animation: rise .7s var(--ease) both; }
+
+/* ---------- home ---------- */
+.home-hero { display: grid; justify-items: center; text-align: center; gap: 10px; padding-top: 18px; }
+.home-hero .logo { width: 132px; opacity: .9; animation: rise .9s var(--ease) both; }
+.home-hero h1 { font-family: var(--display); font-weight: 400; font-size: clamp(54px, 17vw, 96px); line-height: 1; letter-spacing: .08em; margin: 6px 0 0; padding-left: .08em; color: var(--fg);
+  text-shadow: 0 10px 40px rgba(127,170,211,.25); animation: rise 1.1s .1s var(--ease) both; }
+.home-hero .rule { width: 64px; height: 1px; background: var(--gold); transform-origin: center; animation: sweep 1s .5s var(--ease-io) both; }
+.home-hero p { max-width: 32ch; color: var(--mute); margin: 4px 0 0; animation: rise 1s .35s var(--ease) both; }
+.fan { --w: clamp(74px, 22vw, 104px); position: relative; height: calc(var(--w) * 1.4 + 34px); margin: 4px auto 0; width: 100%; cursor: pointer; }
+.fan .fan-pos { position: absolute; top: 10px; left: calc(50% - var(--w) / 2 + var(--x) * var(--w) * .62); width: var(--w); transform: rotate(var(--rot)) translateY(var(--dy)); transform-origin: 50% 130%; }
+.fan .slot { animation: deal 1s var(--ease) both; }
+.fan .card { width: 100%; padding: 0; justify-content: center; animation: float 6s ease-in-out infinite; }
+.fan .card .card-txt, .fan .card .card-name { display: none; }
+.fan .card .card-ico { width: 56%; }
+.panel { background: linear-gradient(180deg, rgba(27,47,66,.78), rgba(20,36,52,.78)); border: 1px solid var(--line); border-radius: 20px; padding: 20px; display: grid; gap: 14px;
+  box-shadow: 0 30px 60px -30px rgba(0,0,0,.7); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+.field { display: grid; gap: 7px; }
+.field label { font-size: 12px; color: var(--mute); letter-spacing: .06em; }
+.input { -webkit-appearance: none; appearance: none; min-width: 0; width: 100%; min-height: 52px; border-radius: 14px; border: 1px solid var(--line-2); background: rgba(9,17,25,.5); color: var(--fg); font: inherit; font-size: 16px; padding: 0 16px; transition: border-color .25s ease, background .25s ease; }
+.input:focus { outline: none; border-color: var(--gold); background: rgba(9,17,25,.7); }
+.input::placeholder { color: var(--faint); }
+.input.code { font-family: var(--display); letter-spacing: .35em; text-transform: uppercase; text-align: center; font-size: 22px; padding: 0 8px 0 calc(8px + .35em); }
+.or { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
+.or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.join { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+.join .btn { width: auto; padding: 0 18px; }
+.home-hero, .panel, .stage, .seat, .act, .target, .prow { min-width: 0; }
+.notice { border: 1px solid color-mix(in srgb, var(--gold) 35%, transparent); background: color-mix(in srgb, var(--gold) 7%, transparent); color: var(--gold-2); border-radius: 14px; padding: 12px 14px; font-size: 14px; }
+
+/* ---------- topo do jogo ---------- */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.top .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.top .brand b { font-family: var(--display); font-weight: 400; letter-spacing: .18em; font-size: 17px; }
+.top .brand span { font-size: 12px; color: var(--mute); letter-spacing: .12em; white-space: nowrap; }
+.top .brand span em { font-style: normal; color: var(--gold); font-family: var(--display); letter-spacing: .26em; }
+.icons { display: flex; gap: 8px; }
+.ibtn { width: 40px; height: 40px; border-radius: 12px; border: 1px solid var(--line); display: grid; place-items: center; color: var(--mute); transition: color .2s ease, border-color .2s ease; }
+.ibtn:hover { color: var(--fg); border-color: var(--line-2); }
+.ibtn svg { width: 19px; height: 19px; }
+
+/* ---------- lobby ---------- */
+.code-big { font-family: var(--display); font-size: clamp(40px, 13vw, 72px); letter-spacing: .24em; padding-left: .24em; white-space: nowrap; line-height: 1; text-align: center; color: var(--fg); }
+.code-big span { display: inline-block; animation: rise .8s var(--ease) both; }
+.plist { display: grid; gap: 8px; }
+.prow { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 14px; background: rgba(9,17,25,.35); border: 1px solid var(--line); animation: rise .6s var(--ease) both; }
+.prow .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag { font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--gold); border: 1px solid color-mix(in srgb, var(--gold) 40%, transparent); border-radius: 99px; padding: 1px 8px; margin-left: 8px; vertical-align: 2px; white-space: nowrap; }
+.tag.you { color: var(--mute); border-color: var(--line-2); }
+.avatar { width: 36px; height: 36px; flex: none; border-radius: 50%; display: grid; place-items: center; font-family: var(--display); font-size: 15px; color: #0E1A26; background: var(--av); box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); }
+.empty-seat { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 14px; border: 1px dashed var(--line-2); color: var(--faint); font-size: 14px; }
+.empty-seat .avatar { background: transparent; border: 1px dashed var(--line-2); box-shadow: none; }
+
+/* ---------- mesa ---------- */
+.seats { display: grid; gap: 8px; }
+.seat { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 16px; background: rgba(20,36,52,.6); border: 1px solid var(--line); transition: background .4s ease, opacity .4s ease; position: relative; }
+.seat.turn { animation: breathe 2.6s ease-in-out infinite; background: rgba(35,59,83,.55); }
+.seat.out { opacity: .5; }
+.seat-mid { flex: 1; min-width: 0; }
+.seat-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seat-sub { font-size: 12px; color: var(--mute); min-height: 1.2em; }
+.seat-sub.hot { color: var(--gold); }
+.seat-cards { display: flex; gap: 5px; }
+.coins { position: relative; display: flex; align-items: center; gap: 5px; color: var(--gold); font-weight: 500; font-size: 15px; min-width: 42px; justify-content: flex-end; }
+.coins svg { width: 15px; height: 15px; }
+.coins .num.pop { animation: pop .6s var(--ease); display: inline-block; }
+.bubble { position: absolute; left: 50%; top: -14px; font-size: 13px; font-weight: 600; color: var(--gold-2); white-space: nowrap; pointer-events: none; animation: coinUp 1.5s var(--ease) both; }
+.bubble.neg { color: var(--bad); }
+
+/* palco do lance */
+.stage { position: relative; text-align: center; padding: 22px 18px 20px; border-radius: 22px; overflow: hidden;
+  background: radial-gradient(120% 90% at 50% 0%, rgba(200,176,120,.09), transparent 60%), linear-gradient(180deg, rgba(27,47,66,.85), rgba(17,31,45,.85));
+  border: 1px solid var(--line); display: grid; gap: 8px; justify-items: center; }
+.stage::before { content: ""; position: absolute; left: 50%; top: 0; width: 46%; height: 1px; transform: translateX(-50%); background: linear-gradient(90deg, transparent, var(--gold), transparent); opacity: .7; }
+.stage h2 { font-family: var(--display); font-weight: 400; font-size: clamp(24px, 7vw, 30px); line-height: 1.15; margin: 0; letter-spacing: .02em; text-wrap: balance; }
+.stage .detail { color: var(--mute); max-width: 34ch; font-size: 14.5px; text-wrap: balance; }
+.stage .role-pill { display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px 4px 6px; border-radius: 99px; border: 1px solid color-mix(in srgb, var(--rc) 45%, transparent); background: color-mix(in srgb, var(--rc) 10%, transparent); font-size: 13px; }
+.stage .role-pill i { width: 22px; height: 22px; color: var(--rc); display: grid; place-items: center; }
+.stage .role-pill i svg { width: 100%; }
+.chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 4px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); color: var(--mute); background: rgba(9,17,25,.3); }
+.chip .d { width: 6px; height: 6px; border-radius: 50%; background: var(--gold); animation: pulseDot 1.4s ease-in-out infinite; }
+.chip.done { color: var(--fg); border-color: var(--line-2); }
+.chip.done .d { animation: none; background: var(--good); }
+.chip.bad .d { background: var(--bad); }
+.unstick { margin-top: 6px; font-size: 13px; color: var(--gold); border: 1px solid color-mix(in srgb, var(--gold) 35%, transparent); border-radius: 99px; padding: 6px 14px; }
+
+/* sua mão */
+.hand-head { display: flex; align-items: end; justify-content: space-between; }
+.hand-head .coins { font-size: 26px; font-family: var(--display); gap: 8px; }
+.hand-head .coins svg { width: 22px; height: 22px; }
+.hand-head .coins small { font-family: var(--body); font-size: 12px; color: var(--mute); letter-spacing: .1em; margin-left: 2px; }
+.hand { display: grid; grid-template-columns: repeat(2, minmax(0, 148px)); justify-content: center; gap: 14px; }
+.hand-head { align-items: center; }
+.hand .slot { min-width: 0; }
+
+/* ações */
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.act { --rc: var(--line-2); text-align: left; padding: 12px 13px 11px; border-radius: 14px; border: 1px solid var(--line); background: rgba(20,36,52,.7); display: grid; gap: 3px; position: relative; overflow: hidden;
+  transition: transform .18s var(--ease), border-color .25s ease, background .25s ease, opacity .25s ease; min-height: 78px; align-content: start; }
+.act:hover:not(:disabled) { border-color: var(--line-2); }
+.act:active:not(:disabled) { transform: scale(.97); }
+.act:disabled { opacity: .32; }
+.act .t { font-weight: 500; font-size: 15px; }
+.act .d { font-size: 12px; color: var(--mute); line-height: 1.3; }
+.act .who { display: flex; align-items: center; gap: 6px; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--rc); margin-top: 3px; }
+.act .who .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--rc); }
+.act .have { margin-left: auto; color: var(--good); letter-spacing: .06em; text-transform: none; font-size: 11px; }
+.act.role { border-color: color-mix(in srgb, var(--rc) 28%, transparent); background: linear-gradient(160deg, color-mix(in srgb, var(--rc) 9%, transparent), rgba(20,36,52,.7) 60%); }
+.act.wide { grid-column: 1 / -1; }
+.act.must { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold); }
+.sect-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.sect-title h3 { margin: 0; font-family: var(--display); font-weight: 400; letter-spacing: .14em; text-transform: uppercase; font-size: 13px; color: var(--mute); }
+.targets { display: grid; gap: 8px; }
+.target { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 14px; border: 1px solid var(--line-2); background: rgba(20,36,52,.7); text-align: left; transition: transform .18s var(--ease), border-color .2s; }
+.target:active { transform: scale(.98); }
+.target .grow { flex: 1; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pool { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding-top: 12px; }
+.pool .card { padding: 16% 5% 12%; }
+.pool .card .card-txt { display: none; }
+.pool .card .card-name { font-size: clamp(7.5px, 2.2vw, 11px); letter-spacing: .06em; }
+.card-name { max-width: 100%; overflow-wrap: anywhere; }
+@media (max-width: 380px) {
+  .hand { gap: 10px; }
+  .card-txt { font-size: 10.5px; }
+  .card-name { font-size: 11px; letter-spacing: .1em; }
+  .seat { gap: 9px; padding: 9px 10px; }
+  .seat .avatar { width: 32px; height: 32px; font-size: 13px; }
+  .mini { width: 22px; height: 31px; }
+  .actions { gap: 6px; }
+  .act { padding: 10px 11px; min-height: 72px; }
+  .act .t { font-size: 14px; }
+  .stage { padding: 18px 14px; }
+}
+.pool .lbl { text-align: center; font-size: 11px; color: var(--faint); margin-top: 6px; letter-spacing: .08em; }
+.waiting { text-align: center; color: var(--mute); font-size: 14px; padding: 8px 0; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.dots { display: inline-flex; gap: 4px; }
+.dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--gold); animation: pulseDot 1.2s ease-in-out infinite; }
+.dots i:nth-child(2) { animation-delay: .2s; } .dots i:nth-child(3) { animation-delay: .4s; }
+
+/* histórico */
+.log { display: grid; gap: 0; border-top: 1px solid var(--line); }
+.log div { padding: 9px 2px; border-bottom: 1px solid var(--line); font-size: 13.5px; color: var(--mute); }
+.log div:first-child { color: var(--fg); }
+
+/* fim */
+.winner { text-align: center; display: grid; gap: 10px; justify-items: center; padding: 26px 16px; }
+.winner .crown { width: 54px; color: var(--gold); animation: rise .9s var(--ease) both; }
+.winner h2 { font-family: var(--display); font-weight: 400; font-size: clamp(34px, 11vw, 52px); margin: 0; line-height: 1.05; animation: rise 1s .15s var(--ease) both; text-wrap: balance; }
+.winner .rule { width: 80px; height: 1px; background: var(--gold); animation: sweep 1s .4s var(--ease-io) both; }
+
+/* ---------- momentos ---------- */
+.moment { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; text-align: center;
+  padding: calc(env(safe-area-inset-top,0px) + 24px) max(24px, env(safe-area-inset-right,0px)) calc(env(safe-area-inset-bottom,0px) + 24px) max(24px, env(safe-area-inset-left,0px));
+  background: rgba(8,15,22,.84); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); animation: fade .35s ease both; cursor: pointer; }
+.moment.out { animation: fade .35s ease reverse both; }
+.moment .inner { display: grid; justify-items: center; gap: 14px; max-width: 340px; }
+.moment .eyebrow { animation: rise .6s var(--ease) both; }
+.moment h3 { font-family: var(--display); font-weight: 400; font-size: clamp(26px, 8vw, 34px); line-height: 1.15; margin: 0; animation: rise .7s .08s var(--ease) both; text-wrap: balance; }
+.moment .res { font-size: 16px; color: var(--mute); animation: rise .7s 1.45s var(--ease) both; text-wrap: balance; }
+.moment .res b { color: var(--fg); font-weight: 500; }
+.m-card { width: 150px; perspective: 900px; animation: rise .8s .15s var(--ease) both; }
+.m-flip { position: relative; transform-style: preserve-3d; transition: none; }
+.m-flip .card { backface-visibility: hidden; -webkit-backface-visibility: hidden; }
+.m-flip .card.face { position: absolute; inset: 0; transform: rotateY(180deg); }
+.m-flip.go { animation: mflip 1s .75s var(--ease-io) both; }
+@keyframes mflip { from { transform: rotateY(0); } to { transform: rotateY(180deg); } }
+.m-flip.bluff { animation: shake .6s .8s ease both; }
+.m-flip.bluff .stamp { animation: stampIn .5s 1.2s var(--spring) both; font-size: 17px; }
+.moment.small { inset: auto 0 auto 0; top: 0; background: none; backdrop-filter: none; -webkit-backdrop-filter: none; pointer-events: none; padding-top: calc(env(safe-area-inset-top,0px) + 12px); }
+.banner { display: inline-flex; align-items: center; gap: 10px; padding: 10px 18px; border-radius: 99px; background: rgba(27,47,66,.92); border: 1px solid var(--line-2);
+  box-shadow: 0 20px 40px -18px rgba(0,0,0,.8); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); font-size: 14.5px; animation: bannerIn .5s var(--spring) both; max-width: calc(100vw - 32px); }
+.banner i { width: 18px; height: 18px; color: var(--rc, var(--gold)); display: grid; place-items: center; flex: none; }
+.banner i svg { width: 100%; }
+.moment.small.out .banner { animation: bannerOut .35s ease both; }
+@keyframes bannerIn { from { opacity: 0; transform: translateY(-24px) scale(.96); } to { opacity: 1; transform: none; } }
+@keyframes bannerOut { to { opacity: 0; transform: translateY(-16px); } }
+.big-word { font-family: var(--display); font-size: clamp(54px, 18vw, 84px); letter-spacing: .1em; line-height: 1; animation: rise .9s .05s var(--ease) both; padding-left: .1em; }
+
+/* ---------- regras ---------- */
+.sheet { position: fixed; inset: 0; z-index: 50; background: rgba(8,15,22,.7); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: fade .3s ease both; overflow-y: auto; overscroll-behavior: contain; }
+.sheet .body { max-width: 480px; margin: 0 auto; background: linear-gradient(180deg, #19304A, #0F1E2C); border: 1px solid var(--line); border-bottom: 0; min-height: 100%;
+  padding: calc(env(safe-area-inset-top,0px) + 22px) max(20px, env(safe-area-inset-right,0px)) calc(env(safe-area-inset-bottom,0px) + 40px) max(20px, env(safe-area-inset-left,0px));
+  animation: rise .5s var(--ease) both; display: grid; gap: 18px; align-content: start; }
+.sheet h2 { font-family: var(--display); font-weight: 400; font-size: 30px; margin: 0; letter-spacing: .04em; }
+.sheet h4 { margin: 4px 0 0; font-family: var(--display); font-weight: 400; letter-spacing: .14em; text-transform: uppercase; font-size: 13px; color: var(--gold); }
+.sheet p, .sheet li { color: var(--mute); margin: 0; max-width: 62ch; }
+.sheet ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.sheet p b, .sheet li b { color: var(--fg); font-weight: 500; }
+.rgrid { display: grid; gap: 10px; }
+.rrow { display: grid; grid-template-columns: 64px 1fr; gap: 14px; align-items: center; padding: 10px; border-radius: 14px; border: 1px solid var(--line); background: rgba(9,17,25,.3); }
+.rrow .card { padding: 14% 8%; justify-content: center; border-radius: 9px; }
+.rrow .card .card-name, .rrow .card .card-txt { display: none; }
+.rrow .card .card-ico { width: 64%; }
+.rrow b { display: block; font-family: var(--display); font-weight: 400; letter-spacing: .12em; text-transform: uppercase; font-size: 14px; color: var(--fg); }
+.rrow span { font-size: 13.5px; color: var(--mute); display: block; }
+
+.toast { position: fixed; left: 50%; top: calc(env(safe-area-inset-top,0px) + 14px); transform: translate(-50%, -20px); opacity: 0; z-index: 70; pointer-events: none;
+  background: var(--fg); color: #0E1A26; font-weight: 500; font-size: 14px; padding: 11px 18px; border-radius: 99px; transition: opacity .3s ease, transform .4s var(--spring); max-width: calc(100vw - 40px); text-align: center; }
+.toast.on { opacity: 1; transform: translate(-50%, 0); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-delay: 0ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+</style>
+
+<div class="atmo"><img id="atmoImg" alt=""></div>
+<div id="app"></div>
+<div id="moment" class="moment" hidden></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+const SIMBOLO = "data:image/png;base64,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";
+const LOGO = "data:image/png;base64,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";
+document.getElementById("atmoImg").src = SIMBOLO;
+
+/* =================== cartas e ações =================== */
+const ROLES = {
+  banq: { n: "Banqueiro",  hue: "#D2BC86", act: "Captar", a: "Captar: +3 M", b: "Bloqueia Empréstimo" },
+  sabo: { n: "Sabotador",  hue: "#D27A84", act: "Sabotar", a: "Sabotar: paga 3 M e o alvo perde uma carta", b: "" },
+  tuba: { n: "Tubarão",    hue: "#7FAAD3", act: "Tomar", a: "Tomar: tira 2 M de alguém", b: "Bloqueia Tomar" },
+  head: { n: "Headhunter", hue: "#6FBFA3", act: "Recrutar", a: "Recrutar: compra 2 cartas e devolve 2", b: "Bloqueia Tomar" },
+  juri: { n: "Jurídico",   hue: "#AE9EDB", act: "", a: "", b: "Bloqueia Sabotar" },
+};
+const ROLE_ORDER = ["banq", "sabo", "tuba", "head", "juri"];
+const ICONS = {
+  banq: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 17 24 7l18 10"/><path d="M8 17h32"/><path d="M12 21v14M20 21v14M28 21v14M36 21v14"/><path d="M8 39h32M5 43h38"/></svg>',
+  sabo: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="20" cy="29" r="12"/><path d="M27 18.5l4.5 4.5M29.5 16l4.5 4.5"/><path d="M32 18c1-4 4-6.5 8.5-6"/><path d="M42 5v3.5M46.5 9.5H43M45 5.5l-2 2"/><path d="M14 27a6 6 0 0 1 5-5"/></svg>',
+  tuba: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 34C15 21 23 12 37 9c-4 6-6.5 14-4.5 25"/><path d="M4 39c3 0 4 2.5 7 2.5S15 39 18 39s4 2.5 7 2.5 4-2.5 7-2.5 4 2.5 7 2.5 4-2.5 6-2.5"/></svg>',
+  head: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="24" cy="24" r="15"/><path d="M24 4v7M24 37v7M4 24h7M37 24h7"/><circle cx="24" cy="21" r="4.5"/><path d="M16.5 32.5c2-4.5 13-4.5 15 0"/></svg>',
+  juri: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M24 9v31M16 41h16M9 14h30"/><circle cx="24" cy="9" r="2"/><path d="M9 14 4.5 26M9 14l4.5 12M3.5 26h11a5.5 4 0 0 1-11 0z"/><path d="M39 14l-4.5 12M39 14l4.5 12M33.5 26h11a5.5 4 0 0 1-11 0z"/></svg>',
+};
+const SVG = {
+  coin: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor"><circle cx="8" cy="8" r="6.6" stroke-width="1.3"/><circle cx="8" cy="8" r="3.7" stroke-width=".9" opacity=".6"/></svg>',
+  book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5z"/><path d="M4 20.5A2.5 2.5 0 0 0 6.5 23H20"/></svg>',
+  sound: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg>',
+  mute: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9.5l5 5M22 9.5l-5 5"/></svg>',
+  exit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h5v16h-5"/><path d="M10 8l-4 4 4 4M6 12h10"/></svg>',
+  crown: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 36 4 14l11 9 9-14 9 14 11-9-3 22z"/><path d="M8 41h32"/></svg>',
+  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
+};
+const ACTS = {
+  salario:    { l: "Salário", d: "+1 M. Ninguém bloqueia.", claim: null },
+  emprestimo: { l: "Empréstimo", d: "+2 M. O Banqueiro bloqueia.", claim: null, blockRoles: ["banq"], blockBy: "any" },
+  captar:     { l: "Captar", d: "+3 M", claim: "banq" },
+  tomar:      { l: "Tomar", d: "Tira 2 M de alguém", claim: "tuba", target: true, blockRoles: ["tuba", "head"], blockBy: "target" },
+  sabotar:    { l: "Sabotar", d: "Paga 3 M. O alvo perde uma carta.", claim: "sabo", cost: 3, target: true, blockRoles: ["juri"], blockBy: "target" },
+  recrutar:   { l: "Recrutar", d: "Compra 2 cartas e devolve 2", claim: "head" },
+  aquisicao:  { l: "Aquisição hostil", d: "Paga 7 M. O alvo perde uma carta. Ninguém bloqueia.", claim: null, cost: 7, target: true },
+};
+const ACT_ORDER = ["salario", "emprestimo", "captar", "tomar", "sabotar", "recrutar", "aquisicao"];
+
+/* =================== regras puras (rodam sobre uma cópia do estado) =================== */
+const P = (s, id) => s.players.find(p => p.id === id);
+const alive = p => !!p && p.cards.some(c => !c.dead);
+const liveIdx = p => p.cards.map((c, i) => c.dead ? -1 : i).filter(i => i >= 0);
+const nick = (s, id) => (P(s, id) || {}).nick || "Alguém";
+const newPid = () => Math.random().toString(36).slice(2, 10);
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function log(s, m, ev) { s.logN = (s.logN || 0) + 1; s.log.push({ n: s.logN, m, ev: ev || null }); if (s.log.length > 50) s.log.splice(0, s.log.length - 50); }
+
+function startGame(s) {
+  s.deck = shuffle(ROLE_ORDER.flatMap(r => [r, r, r]));
+  s.players.forEach(p => { p.cards = [{ r: s.deck.pop(), dead: false }, { r: s.deck.pop(), dead: false }]; p.coins = 2; });
+  const first = s.players[Math.floor(Math.random() * s.players.length)];
+  if (s.players.length === 2) first.coins = 1;
+  s.turn = first.id; s.status = "play"; s.winner = null; s.log = []; s.resp = {}; s.round = (s.round || 0) + 1;
+  log(s, `Cartas na mesa. ${first.nick} abre a partida.`, { t: "start" });
+  s.phase = { k: "turn", pid: newPid() };
+}
+function endTurn(s) {
+  if (s.status !== "play") return;
+  const n = s.players.length, i = s.players.findIndex(p => p.id === s.turn);
+  for (let k = 1; k <= n; k++) { const p = s.players[(i + k) % n]; if (alive(p)) { s.turn = p.id; break; } }
+  s.phase = { k: "turn", pid: newPid() }; s.resp = {};
+}
+function checkWin(s) {
+  const al = s.players.filter(alive);
+  if (al.length === 1 && s.status === "play") {
+    s.status = "over"; s.winner = al[0].id; s.phase = { k: "over", pid: newPid() }; s.resp = {};
+    log(s, `${al[0].nick} venceu a partida.`, { t: "win", who: al[0].id });
+  }
+}
+function kill(s, id, idx) {
+  const p = P(s, id), c = p.cards[idx]; c.dead = true;
+  log(s, `${p.nick} entregou ${ROLES[c.r].n}.`, { t: "lost", who: id, role: c.r });
+  if (!alive(p)) log(s, `${p.nick} está fora.`, { t: "out", who: id });
+  checkWin(s);
+}
+function lose(s, id, next) {
+  const p = P(s, id), li = liveIdx(p);
+  if (li.length === 0) return cont(s, next);
+  if (li.length === 1) { kill(s, id, li[0]); return cont(s, next); }
+  s.phase = { k: "lose", pid: newPid(), who: id, next }; s.resp = {};
+}
+function cont(s, next) {
+  if (s.status !== "play") return;
+  const act = next.act;
+  if (next.k === "end") return endTurn(s);
+  if (next.k === "perform") return perform(s, act);
+  if (next.k === "blocked") { log(s, `${ACTS[act.type].l} de ${nick(s, act.actor)} foi bloqueado.`); return endTurn(s); }
+  if (next.k === "blockOnly") {
+    if (!alive(P(s, act.target))) return perform(s, act);
+    s.phase = { k: "react", pid: newPid(), act, stage: "blockOnly" }; s.resp = {}; return;
+  }
+}
+function perform(s, act) {
+  const a = P(s, act.actor), t = act.target ? P(s, act.target) : null;
+  if (!alive(a)) return endTurn(s);
+  switch (act.type) {
+    case "emprestimo": a.coins += 2; log(s, `${a.nick} pegou o Empréstimo: +2 M.`); return endTurn(s);
+    case "captar": a.coins += 3; log(s, `${a.nick} captou 3 M.`); return endTurn(s);
+    case "tomar": { if (!alive(t)) return endTurn(s); const v = Math.min(2, t.coins); t.coins -= v; a.coins += v; log(s, `${a.nick} tomou ${v} M de ${t.nick}.`); return endTurn(s); }
+    case "sabotar": if (!alive(t)) return endTurn(s); log(s, `${a.nick} sabotou ${t.nick}.`); return lose(s, t.id, { k: "end" });
+    case "recrutar": { const drawn = [s.deck.pop(), s.deck.pop()].filter(Boolean); s.phase = { k: "exchange", pid: newPid(), who: a.id, drawn }; s.resp = {}; return; }
+  }
+  endTurn(s);
+}
+function declare(s, me, type, target) {
+  if (s.status !== "play" || s.phase.k !== "turn" || s.turn !== me) return "Não é a sua vez.";
+  const a = P(s, me), A = ACTS[type];
+  if (!A) return "Ação inválida.";
+  if (a.coins >= 10 && type !== "aquisicao") return "Com 10 M ou mais, a Aquisição hostil é obrigatória.";
+  if (A.cost && a.coins < A.cost) return `Você precisa de ${A.cost} M.`;
+  if (A.target) { const t = P(s, target); if (!t || !alive(t) || t.id === me) return "Escolha um alvo que ainda está no jogo."; }
+  const act = { type, actor: me, target: A.target ? target : null };
+  if (A.cost) a.coins -= A.cost;
+  const t = act.target ? nick(s, act.target) : "";
+  if (type === "salario") { a.coins += 1; log(s, `${a.nick} pegou Salário: +1 M.`); return endTurn(s); }
+  if (type === "aquisicao") { log(s, `${a.nick} fez uma Aquisição hostil em ${t}.`, { t: "coup", who: me, target }); return lose(s, target, { k: "end" }); }
+  const msg = {
+    emprestimo: `${a.nick} pediu Empréstimo.`,
+    captar: `${a.nick} diz ser Banqueiro e quer Captar 3 M.`,
+    tomar: `${a.nick} diz ser Tubarão e quer Tomar 2 M de ${t}.`,
+    sabotar: `${a.nick} diz ser Sabotador e pagou 3 M para sabotar ${t}.`,
+    recrutar: `${a.nick} diz ser Headhunter e quer Recrutar.`,
+  }[type];
+  log(s, msg);
+  s.phase = { k: "react", pid: newPid(), act, stage: "action" }; s.resp = {};
+}
+function options(s, ph, id) {
+  const p = P(s, id);
+  if (!alive(p) || !ph || !ph.act) return null;
+  const act = ph.act, A = ACTS[act.type];
+  if (ph.k === "react") {
+    if (id === act.actor) return null;
+    if (ph.stage === "blockOnly" && id !== act.target) return null;
+    const o = { challenge: ph.stage === "action" && !!A.claim, blocks: [] };
+    if (A.blockRoles && (A.blockBy === "any" || id === act.target)) o.blocks = A.blockRoles;
+    return (o.challenge || o.blocks.length) ? o : null;
+  }
+  if (ph.k === "blockReact") return id === ph.blocker ? null : { challenge: true, blocks: [] };
+  return null;
+}
+const eligibleIds = (s, ph) => s.players.filter(p => options(s, ph, p.id)).map(p => p.id);
+function validResps(s, ph) {
+  return eligibleIds(s, ph).map(id => { const r = s.resp && s.resp[id]; return r && r.pid === ph.pid ? { id, r: r.r, role: r.role, t: r.t || 0 } : null; }).filter(Boolean);
+}
+function resolvable(s) {
+  const ph = s && s.phase;
+  if (!ph || s.status !== "play" || (ph.k !== "react" && ph.k !== "blockReact")) return false;
+  const rs = validResps(s, ph);
+  if (rs.some(r => r.r === "challenge" || r.r === "block")) return true;
+  return rs.length >= eligibleIds(s, ph).length;
+}
+function challenge(s, claimant, role, challenger, nextHonest, nextBluff, onBluff) {
+  const p = P(s, claimant), idx = p.cards.findIndex(c => !c.dead && c.r === role);
+  if (idx >= 0) {
+    log(s, `${nick(s, challenger)} duvidou, mas ${p.nick} tinha ${ROLES[role].n}. A carta volta ao baralho e ${p.nick} compra outra.`, { t: "reveal", who: claimant, by: challenger, role, honest: true });
+    s.deck.push(role); shuffle(s.deck); p.cards[idx] = { r: s.deck.pop(), dead: false };
+    return lose(s, challenger, nextHonest);
+  }
+  log(s, `${nick(s, challenger)} duvidou e acertou: ${p.nick} não tinha ${ROLES[role].n}.`, { t: "reveal", who: claimant, by: challenger, role, honest: false });
+  if (onBluff) onBluff();
+  return lose(s, claimant, nextBluff);
+}
+function resolve(s) {
+  const ph = s.phase, act = ph.act, A = ACTS[act.type];
+  const rs = validResps(s, ph).sort((x, y) => x.t - y.t);
+  const ch = rs.find(r => r.r === "challenge");
+  if (ph.k === "react") {
+    if (ch) {
+      const honestNext = (A.blockBy === "target" && act.target && ph.stage === "action") ? { k: "blockOnly", act } : { k: "perform", act };
+      return challenge(s, act.actor, A.claim, ch.id, honestNext, { k: "end" }, () => { if (act.type === "sabotar") P(s, act.actor).coins += 3; });
+    }
+    const bl = rs.find(r => r.r === "block" && (options(s, ph, r.id) || { blocks: [] }).blocks.includes(r.role));
+    if (bl) {
+      log(s, `${nick(s, bl.id)} bloqueou dizendo ser ${ROLES[bl.role].n}.`, { t: "block", who: bl.id, role: bl.role });
+      s.phase = { k: "blockReact", pid: newPid(), act, blocker: bl.id, role: bl.role }; s.resp = {}; return;
+    }
+    return perform(s, act);
+  }
+  if (ph.k === "blockReact") {
+    if (ch) return challenge(s, ph.blocker, ph.role, ch.id, { k: "blocked", act }, { k: "perform", act });
+    return cont(s, { k: "blocked", act });
+  }
+}
+function chooseLose(s, me, idx) {
+  const ph = s.phase;
+  if (ph.k !== "lose" || ph.who !== me) return "noop";
+  const p = P(s, me);
+  if (!p.cards[idx] || p.cards[idx].dead) return "Escolha uma carta que ainda está na sua mão.";
+  kill(s, me, idx); cont(s, ph.next);
+}
+function chooseExchange(s, me, keep) {
+  const ph = s.phase;
+  if (ph.k !== "exchange" || ph.who !== me) return "noop";
+  const p = P(s, me), slots = liveIdx(p);
+  const pool = slots.map(i => p.cards[i].r).concat(ph.drawn);
+  if (new Set(keep).size !== slots.length || keep.some(i => i < 0 || i >= pool.length)) return `Escolha ${slots.length} carta${slots.length > 1 ? "s" : ""}.`;
+  slots.forEach((slot, k) => { p.cards[slot] = { r: pool[keep[k]], dead: false }; });
+  pool.forEach((r, i) => { if (!keep.includes(i)) s.deck.push(r); });
+  shuffle(s.deck);
+  log(s, `${p.nick} recrutou e devolveu 2 cartas ao baralho.`);
+  endTurn(s);
+}
+function forcePending(s) {
+  const ph = s.phase;
+  if (s.status !== "play") return "noop";
+  if (ph.k === "react" || ph.k === "blockReact") {
+    eligibleIds(s, ph).forEach(id => { const r = s.resp[id]; if (!r || r.pid !== ph.pid) s.resp[id] = { pid: ph.pid, r: "pass", t: Date.now() }; });
+    log(s, "O anfitrião passou a vez de quem estava ausente.");
+    if (resolvable(s)) resolve(s); return;
+  }
+  if (ph.k === "lose") { const p = P(s, ph.who); log(s, `${p.nick} demorou: a carta foi escolhida no sorteio.`); kill(s, p.id, shuffle(liveIdx(p))[0]); return cont(s, ph.next); }
+  if (ph.k === "exchange") { s.deck.push(...ph.drawn); shuffle(s.deck); log(s, `${nick(s, ph.who)} demorou e manteve as cartas.`); return endTurn(s); }
+  if (ph.k === "turn") {
+    const p = P(s, s.turn);
+    if (p.coins >= 7) { const t = s.players.find(x => x.id !== p.id && alive(x)); return declare(s, p.id, "aquisicao", t.id); }
+    p.coins += 1; log(s, `${p.nick} demorou: Salário automático.`); return endTurn(s);
+  }
+}
+
+/* =================== conexão (db + user) =================== */
+let db = null, user = null, myId = null, env = "loading", canWrite = null;
+let gameRef = null, lockRef = null, unsub = null, state = null, code = null, loadTimer = null, conn = "";
+const tabId = Math.random().toString(36).slice(2, 7);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} },
+};
+const ui = { nick: store.get("blefe.nick", ""), codeIn: "", pick: null, busy: false, rules: false, loseSel: null, exSel: [], leaveArm: false };
+let soundOn = store.get("blefe.som", "1") === "1";
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function errMsg(e) {
+  const c = e && e.code;
+  if (c === "invalid_argument") return "Você não tem permissão para jogar aqui. Peça acesso de Colaborador a quem compartilhou o jogo.";
+  if (c === "resource_exhausted") return "Muitas jogadas seguidas. Espere um instante.";
+  if (c === "quota_exceeded") return "O jogo ficou sem espaço. Avise quem criou a página.";
+  return "Não deu para falar com a mesa. Confira a internet e tente de novo.";
+}
+
+let queue = Promise.resolve();
+function commit(mut, silent) { const p = queue.then(() => doCommit(mut, silent)); queue = p.catch(() => {}); return p; }
+async function doCommit(mut, silent) {
+  if (!gameRef) return "err";
+  const holder = myId + "." + tabId;
+  for (let i = 0; i < 12; i++) {
+    let r;
+    try { r = await lockRef.acquire({ holder, ttlMs: 5000 }); }
+    catch (e) { if (!silent) toast(errMsg(e)); return "err"; }
+    if (!r.acquired) {
+      const exp = Date.parse(r.expiresAt || "") || 0;
+      await sleep(Math.min(5200, Math.max(120, exp - Date.now() + 60)) + Math.random() * 140);
+      continue;
+    }
+    try {
+      const snap = await gameRef.get();
+      if (!snap.exists) { if (!silent) toast("Essa mesa não existe mais."); return "err"; }
+      const s = structuredClone(snap.data());
+      const res = mut(s);
+      if (typeof res === "string") { if (res !== "noop" && !silent) toast(res); return "noop"; }
+      s.v = (s.v || 0) + 1; s.at = Date.now();
+      await gameRef.set(s);
+      return "ok";
+    } catch (e) { if (!silent) toast(errMsg(e)); return "err"; }
+    finally { lockRef.acquire({ holder, ttlMs: 1000 }).catch(() => {}); }
+  }
+  if (!silent) toast("A mesa está ocupada. Tente de novo.");
+  return "err";
+}
+async function act(mut) {
+  if (ui.busy) return;
+  ui.busy = true; render();
+  const r = await commit(mut, false);
+  ui.busy = false; render();
+  return r;
+}
+
+let resolveTimer = null;
+function autoResolve(tries = 0) {
+  clearTimeout(resolveTimer);
+  const s = state;
+  if (!s || !resolvable(s)) return;
+  const pid = s.phase.pid, driver = s.phase.act.actor === myId;
+  const delay = tries ? 1200 + Math.random() * 800 : (driver ? 0 : 2200 + Math.random() * 1600);
+  resolveTimer = setTimeout(async () => {
+    const r = await commit(x => (x.phase.pid !== pid || !resolvable(x)) ? "noop" : resolve(x), true);
+    if (r !== "ok" && tries < 5 && state && state.phase.pid === pid && resolvable(state)) autoResolve(tries + 1);
+  }, delay);
+}
+
+function watch(c) {
+  if (unsub) unsub();
+  code = c; gameRef = db.doc("mesas/" + c); lockRef = db.doc("travas/" + c);
+  state = null; firstSnap = true; conn = "";
+  clearTimeout(loadTimer);
+  loadTimer = setTimeout(() => { conn = state ? "A conexão está lenta. A mesa pode estar desatualizada." : "A mesa ainda não respondeu. Confira a internet."; render(); }, 10000);
+  unsub = gameRef.onSnapshot(snap => {
+    if (!snap.metadata.fromCache) { clearTimeout(loadTimer); conn = ""; }
+    const next = snap.exists ? snap.data() : null;
+    if (!next) { if (!snap.metadata.fromCache) { leaveLocal(); toast("Essa mesa foi encerrada."); } return; }
+    onState(next);
+  }, e => { clearTimeout(loadTimer); conn = e && e.code === "revoked" ? "Seu acesso a esta mesa mudou." : "A conexão com a mesa caiu. Recarregue a página."; render(); });
+  store.set("blefe.mesa", c);
+  render();
+}
+function leaveLocal() {
+  if (unsub) unsub(); unsub = null; state = null; code = null; gameRef = lockRef = null;
+  store.set("blefe.mesa", null); ui.pick = null; ui.leaveArm = false; render();
+}
+
+/* =================== efeitos: diferenças entre estados =================== */
+const FX = {};
+function mark(key, data) { FX[key] = Object.assign({ at: performance.now() }, data || {}); }
+function fxOf(key, dur) { const f = FX[key]; if (!f) return null; const el = performance.now() - f.at; if (el > dur) { delete FX[key]; return null; } return Object.assign({}, f, { delay: -el }); }
+let firstSnap = true, seenLog = 0, lastTurnPid = null;
+function onState(next) {
+  const prev = state;
+  if (prev && !firstSnap) {
+    next.players.forEach(p => {
+      const q = prev.players.find(x => x.id === p.id);
+      if (!q) return;
+      if (q.coins !== p.coins && next.status === "play" && prev.status === "play") { mark("coin:" + p.id, { d: p.coins - q.coins }); }
+      p.cards.forEach((c, i) => {
+        const o = q.cards[i];
+        if (c.dead && (!o || !o.dead)) mark(`card:${p.id}:${i}`);
+        else if (p.id === myId && o && !c.dead && o.r !== c.r && prev.status === "play") mark(`card:${p.id}:${i}`);
+      });
+    });
+    if (prev.status !== "play" && next.status === "play") mark("deal");
+    if (!prev.phase || prev.phase.pid !== next.phase.pid) { mark("stage"); ui.pick = null; ui.loseSel = null; ui.exSel = []; }
+  }
+  // momentos a partir do histórico
+  const lastN = next.logN || 0;
+  if (firstSnap || (prev && prev.round !== next.round && next.status !== "play")) seenLog = lastN;
+  else if (lastN > seenLog) { next.log.filter(e => e.n > seenLog && e.ev).forEach(e => playEv(next, e.ev)); seenLog = lastN; }
+  // sua vez
+  if (next.status === "play" && next.phase.k === "turn" && next.turn === myId && next.phase.pid !== lastTurnPid) {
+    lastTurnPid = next.phase.pid;
+    if (!firstSnap) { pushMoment({ size: "small", icon: SVG.coin, text: "Sua vez" }); sfx("turn"); try { navigator.vibrate && navigator.vibrate([18, 60, 18]); } catch (e) {} }
+  }
+  if (next.status === "play" && next.phase.k === "lose" && next.phase.who === myId && !firstSnap && (!prev || prev.phase.pid !== next.phase.pid)) { try { navigator.vibrate && navigator.vibrate(40); } catch (e) {} }
+  if (!firstSnap && (!prev || prev.phase.pid !== next.phase.pid) && needsMe(next)) ui.scrollTo = true;
+  firstSnap = false;
+  state = next;
+  render();
+  autoResolve();
+}
+function playEv(s, ev) {
+  const n = id => nick(s, id);
+  if (ev.t === "reveal") { pushMoment({ size: "big", kind: "reveal", ev, names: { who: n(ev.who), by: n(ev.by) } }); }
+  else if (ev.t === "block") pushMoment({ size: "small", role: ev.role, text: `${n(ev.who)} bloqueou como ${ROLES[ev.role].n}` });
+  else if (ev.t === "lost") { pushMoment({ size: "small", role: ev.role, text: ev.who === myId ? `Você entregou ${ROLES[ev.role].n}` : `${n(ev.who)} entregou ${ROLES[ev.role].n}` }); sfx("lost"); }
+  else if (ev.t === "out") pushMoment({ size: "big", kind: "out", text: ev.who === myId ? "Você está fora" : `${n(ev.who)} está fora`, sub: ev.who === myId ? "Fica de olho: dá para assistir até o fim." : "Sem cartas na mão, sem lugar na mesa." });
+  else if (ev.t === "coup") pushMoment({ size: "small", icon: SVG.crown, text: `${n(ev.who)} fez uma Aquisição hostil em ${ev.target === myId ? "você" : n(ev.target)}` });
+  else if (ev.t === "win") sfx("win");
+  else if (ev.t === "start") sfx("deal");
+}
+
+/* =================== momentos (overlay) =================== */
+const $m = document.getElementById("moment");
+const mq = []; let mPlaying = false, mTimer = null;
+function pushMoment(m) {
+  if (mq.length > 4) { const i = mq.findIndex(x => x.size === "small"); if (i >= 0) mq.splice(i, 1); }
+  mq.push(m); if (!mPlaying) nextMoment();
+}
+function nextMoment() {
+  clearTimeout(mTimer);
+  const m = mq.shift();
+  if (!m) { mPlaying = false; $m.hidden = true; $m.replaceChildren(); return; }
+  mPlaying = true;
+  $m.className = "moment " + m.size; $m.hidden = false; $m.replaceChildren(momentEl(m));
+  if (m.kind === "reveal") setTimeout(() => sfx(m.ev.honest ? "reveal" : "bluff"), 1100);
+  mTimer = setTimeout(endMoment, m.size === "big" ? (m.kind === "reveal" ? 3300 : 2300) : 1900);
+}
+function endMoment() { clearTimeout(mTimer); $m.classList.add("out"); mTimer = setTimeout(nextMoment, 340); }
+$m.addEventListener("click", () => { if (mPlaying && !$m.classList.contains("out")) endMoment(); });
+function momentEl(m) {
+  if (m.size === "small") {
+    const rc = m.role ? ROLES[m.role].hue : null;
+    return h("div", { class: "banner", style: rc ? `--rc:${rc}` : null }, h("i", { html: m.role ? ICONS[m.role] : (m.icon || SVG.coin) }), h("span", null, m.text));
+  }
+  if (m.kind === "reveal") {
+    const { ev, names } = m, R = ROLES[ev.role];
+    const target = ev.who === myId ? "você" : names.who, by = ev.by === myId ? "Você" : names.by;
+    const flip = h("div", { class: "m-flip " + (ev.honest ? "go" : "bluff") },
+      cardEl(null, { back: true, extra: ev.honest ? null : h("div", { class: "stamp" }, "Blefe") }),
+      ev.honest ? cardEl(ev.role, { face: true }) : null);
+    return h("div", { class: "inner" },
+      h("div", { class: "eyebrow" }, "Dúvida"),
+      h("h3", null, `${by} ${ev.by === myId ? "duvidou" : "duvidou"} ${ev.who === myId ? "de você" : "de " + target}`),
+      h("div", { class: "m-card" }, flip),
+      h("div", { class: "res" }, ev.honest
+        ? [h("b", null, `${ev.who === myId ? "Você tinha" : names.who + " tinha"} ${R.n}.`), ` ${ev.by === myId ? "Você perde" : names.by + " perde"} uma carta.`]
+        : [h("b", null, `${ev.who === myId ? "Você blefou" : names.who + " blefou"}.`), ` Não tinha ${R.n} e perde uma carta.`]));
+  }
+  if (m.kind === "out") return h("div", { class: "inner" }, h("div", { class: "eyebrow" }, "Eliminação"), h("div", { class: "big-word" }, "Fora"), h("h3", null, m.text), h("div", { class: "res", style: "animation-delay:.3s" }, m.sub));
+  return h("div");
+}
+
+/* =================== som (sintetizado, liga no primeiro toque) =================== */
+let ac = null;
+function audio() { try { if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)(); if (ac.state === "suspended") ac.resume(); } catch (e) { ac = null; } return ac; }
+document.addEventListener("pointerdown", () => audio(), { once: true });
+function tone(f, t0, dur, type, g) {
+  const a = ac, o = a.createOscillator(), v = a.createGain(), t = a.currentTime + t0;
+  o.type = type || "sine"; o.frequency.setValueAtTime(f, t);
+  v.gain.setValueAtTime(0, t); v.gain.linearRampToValueAtTime(g || .07, t + .012); v.gain.exponentialRampToValueAtTime(.0001, t + dur);
+  o.connect(v).connect(a.destination); o.start(t); o.stop(t + dur + .05);
+}
+function sfx(name) {
+  if (!soundOn || !ac || ac.state !== "running") return;
+  ({
+    turn: () => { tone(880, 0, .5, "sine", .06); tone(1318.5, .11, .7, "sine", .05); },
+    reveal: () => { [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * .07, .9, "sine", .05)); },
+    bluff: () => { tone(311, 0, .35, "triangle", .09); tone(233, .14, .6, "triangle", .09); },
+    lost: () => tone(196, 0, .45, "sine", .08),
+    tap: () => tone(1600, 0, .06, "sine", .025),
+    deal: () => { for (let i = 0; i < 4; i++) tone(2400 - i * 200, i * .08, .05, "triangle", .02); },
+    win: () => { [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => tone(f, i * .12, 1.4, "sine", .05)); },
+  }[name] || (() => {}))();
+}
+
+/* =================== DOM helpers =================== */
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  if (props) for (const [k, v] of Object.entries(props)) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "html") el.innerHTML = v;      // só SVG/constantes do próprio código
+    else if (k === "style") el.style.cssText = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of kids.flat(Infinity)) { if (c == null || c === false) continue; el.append(c instanceof Node ? c : document.createTextNode(String(c))); }
+  return el;
+}
+const AV = ["#D2BC86", "#7FAAD3", "#6FBFA3", "#AE9EDB", "#D9A07A", "#9CC4D6", "#C9B3D9", "#B7C98A"];
+function avatarEl(p) {
+  let hsh = 0; for (const ch of p.id) hsh = (hsh * 31 + ch.charCodeAt(0)) >>> 0;
+  return h("div", { class: "avatar", style: `--av:${AV[hsh % AV.length]}`, "aria-hidden": "true" }, (p.nick || "?").trim().charAt(0).toUpperCase());
+}
+function cardEl(r, o = {}) {
+  const fx = o.fxKey ? fxOf(o.fxKey, 800) : null;
+  const deal = o.deal ? fxOf("deal", 1600) : null;
+  let cls = "card", style = "";
+  if (fx) { cls += " fx-flip"; style += `animation-delay:${fx.delay}ms;`; }
+  else if (deal) { cls += " fx-deal"; style += `animation-delay:${deal.delay + (o.dealIdx || 0) * 160 + 250}ms;`; }
+  if (!r || o.back) {
+    return h("div", { class: cls + " back" + (o.face ? " face" : ""), style }, h("img", { src: SIMBOLO, alt: "" }), o.extra || null);
+  }
+  const R = ROLES[r];
+  cls += (o.dead ? " dead" : "") + (o.selectable ? " selectable" : "") + (o.sel ? " sel" : "") + (o.face ? " face" : "");
+  return h("div", {
+    class: cls, style: style + `--rc:${R.hue}`,
+    role: o.onclick ? "button" : null, tabindex: o.onclick ? "0" : null, "aria-label": R.n + (o.dead ? " (revelada)" : ""),
+    onclick: o.onclick || null, onkeydown: o.onclick ? (e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); o.onclick(); } }) : null,
+  },
+    h("div", { class: "card-ico", html: ICONS[r] }),
+    h("div", { class: "card-name" }, R.n),
+    h("div", { class: "card-txt" }, R.a ? h("span", null, R.a) : null, R.b ? h("b", null, R.b) : null),
+    o.dead ? h("div", { class: "stamp" }, "Revelada") : null);
+}
+function miniEl(p, c, i) {
+  const fx = fxOf(`card:${p.id}:${i}`, 800);
+  if (c.dead) return h("div", { class: "mini dead" + (fx ? " fx-flip" : ""), style: `--rc:${ROLES[c.r].hue};` + (fx ? `animation-delay:${fx.delay}ms` : ""), title: ROLES[c.r].n, html: ICONS[c.r] });
+  const deal = fxOf("deal", 1600);
+  return h("div", { class: "mini" + (deal ? " fx-deal" : ""), style: deal ? `animation-delay:${deal.delay + i * 120}ms` : null }, h("img", { src: SIMBOLO, alt: "" }));
+}
+function coinsEl(p, big) {
+  const fx = fxOf("coin:" + p.id, 1500);
+  return h("div", { class: "coins", "aria-label": `${p.coins} M` },
+    h("span", { html: SVG.coin, style: "display:grid" }),
+    h("span", { class: "num" + (fx ? " pop" : "") }, p.coins),
+    big ? h("small", null, "M") : null,
+    fx ? h("span", { class: "bubble" + (fx.d < 0 ? " neg" : ""), style: `animation-delay:${fx.delay}ms` }, (fx.d > 0 ? "+" : "−") + Math.abs(fx.d) + " M") : null);
+}
+let toastT = null;
+function toast(msg) { const t = document.getElementById("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("on"), 3200); }
+
+/* =================== telas =================== */
+const $app = document.getElementById("app");
+function render() {
+  const y = window.scrollY;
+  let view;
+  if (!code || !state) view = code && env === "ok" ? loadingView() : homeView();
+  else if (state.status === "lobby") view = lobbyView(state);
+  else view = gameView(state);
+  $app.replaceChildren(view);
+  if (ui.rules) $app.append(rulesView());
+  window.scrollTo(0, y);
+  if (ui.scrollTo) {
+    ui.scrollTo = false;
+    const target = state && state.phase.k === "lose" ? document.getElementById("myhand") : document.getElementById("mypanel");
+    if (target) {
+      const r = target.getBoundingClientRect();
+      if (r.top > innerHeight - 140 || r.bottom < 80) {
+        const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+        window.scrollTo({ top: Math.max(0, r.top + scrollY - innerHeight * .3), behavior: reduce ? "auto" : "smooth" });
+      }
+    }
+  }
+}
+function needsMe(s) {
+  const ph = s.phase;
+  if (s.status !== "play" || !alive(P(s, myId))) return false;
+  if (ph.k === "turn") return s.turn === myId;
+  if (ph.k === "lose" || ph.k === "exchange") return ph.who === myId;
+  if (ph.k === "react" || ph.k === "blockReact") return !!options(s, ph, myId);
+  return false;
+}
+function topBar(extra) {
+  return h("div", { class: "top" },
+    h("div", { class: "brand" }, h("b", null, "BLEFE"), code ? h("span", null, "MESA ", h("em", null, code)) : null),
+    h("div", { class: "icons" },
+      h("button", { class: "ibtn", "aria-label": soundOn ? "Desligar som" : "Ligar som", html: soundOn ? SVG.sound : SVG.mute, onclick: () => { soundOn = !soundOn; store.set("blefe.som", soundOn ? "1" : "0"); audio(); sfx("tap"); render(); } }),
+      h("button", { class: "ibtn", "aria-label": "Como jogar", html: SVG.book, onclick: () => { ui.rules = true; render(); } }),
+      extra || null));
+}
+function loadingView() {
+  return h("div", { class: "wrap" }, topBar(),
+    h("div", { class: "stage" }, h("div", { class: "eyebrow" }, "Mesa " + code), h("h2", null, "Entrando na mesa"), h("div", { class: "waiting" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")))),
+    conn ? h("div", { class: "notice" }, conn) : null,
+    h("button", { class: "btn btn-ghost", onclick: leaveLocal }, "Voltar ao início"));
+}
+function homeView() {
+  const fan = h("div", { class: "fan", role: "button", tabindex: "0", "aria-label": "Ver os cargos e as regras", onclick: () => { ui.rules = true; render(); } },
+    ROLE_ORDER.map((r, i) => {
+      const rot = (i - 2) * 9, x = (i - 2) * 17;
+      const c = cardEl(r);
+      c.style.setProperty("--r", "0deg"); c.style.animationDelay = `${i * -1.1}s`;
+      return h("div", { class: "fan-pos", style: `--x:${i - 2};--rot:${rot}deg;--dy:${Math.abs(i - 2) * 8}px` },
+        h("div", { class: "slot", style: `animation-delay:${.35 + i * .09}s` }, c));
+    }));
+  let notice = null;
+  if (env === "offline") notice = "Este visualizador não roda o modo online (o app do Claude no celular não roda). Abra o link no Safari ou no Chrome, logado na sua conta do Claude.";
+  else if (env === "noid") notice = "Entre na sua conta do Claude para jogar.";
+  else if (canWrite === false) notice = "Seu acesso é só de leitura. Peça a quem compartilhou o jogo acesso de Colaborador.";
+  const ready = env === "ok";
+  return h("div", { class: "wrap" },
+    h("div", { class: "home-hero" },
+      h("img", { class: "logo", src: LOGO, alt: "Impulso" }),
+      h("h1", null, "BLEFE"),
+      h("div", { class: "rule" }),
+      h("p", null, "Cinco cargos, duas cartas na mão e ninguém é obrigado a falar a verdade. Quem ficar por último com cartas leva a mesa.")),
+    fan,
+    h("div", { class: "panel fx-rise", style: "animation-delay:.6s" },
+      notice ? h("div", { class: "notice" }, notice) : null,
+      h("div", { class: "field" },
+        h("label", { for: "nick" }, "Seu apelido na mesa"),
+        h("input", { id: "nick", class: "input", maxlength: "16", autocomplete: "nickname", placeholder: "Ex.: Tassão", value: ui.nick, oninput: e => { ui.nick = e.target.value; store.set("blefe.nick", ui.nick); } })),
+      h("button", { class: "btn btn-primary", disabled: ui.busy, onclick: createTable }, ui.busy ? "Um instante" : "Criar mesa"),
+      h("div", { class: "or" }, "ou entre numa mesa"),
+      h("div", { class: "join" },
+        h("input", { id: "codein", class: "input code", maxlength: "4", autocomplete: "off", autocapitalize: "characters", spellcheck: "false", placeholder: "ABCD", "aria-label": "Código da mesa", value: ui.codeIn,
+          oninput: e => { ui.codeIn = e.target.value.toUpperCase().replace(/[^A-Z]/g, ""); e.target.value = ui.codeIn; },
+          onkeydown: e => { if (e.key === "Enter") joinTable(ui.codeIn); } }),
+        h("button", { class: "btn btn-ghost", disabled: ui.busy, onclick: () => joinTable((document.getElementById("codein") || {}).value || ui.codeIn) }, "Entrar"))),
+    !ready && env === "loading" ? h("div", { class: "waiting" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), "Conectando ao jogo") : null,
+    h("button", { class: "btn-text", style: "justify-self:center", onclick: () => { ui.rules = true; render(); } }, "Como jogar"));
+}
+function lobbyView(s) {
+  const isHost = s.host === myId, me = P(s, myId);
+  const empty = Math.max(0, Math.min(2, 6 - s.players.length) - (s.players.length >= 2 ? 1 : 0));
+  return h("div", { class: "wrap" },
+    topBar(),
+    h("div", { class: "stage" },
+      h("div", { class: "eyebrow" }, "Código da mesa"),
+      h("div", { class: "code-big", "aria-label": "Código " + code.split("").join(" ") }, code.split("").map((ch, i) => h("span", { style: `animation-delay:${i * .07}s` }, ch))),
+      h("div", { class: "detail" }, "Mande o código para a galera. Cada um abre o jogo no próprio celular e entra com ele. De 2 a 6 jogadores."),
+      h("button", { class: "unstick", onclick: () => copyCode() }, "Copiar código")),
+    h("div", { class: "sect-title" }, h("h3", null, "Na mesa"), h("span", { class: "mute num", style: "font-size:13px" }, `${s.players.length} de 6`)),
+    h("div", { class: "plist" },
+      s.players.map((p, i) => h("div", { class: "prow", style: `animation-delay:${i * .05}s` },
+        avatarEl(p),
+        h("div", { class: "grow" }, p.nick, p.id === s.host ? h("span", { class: "tag" }, "anfitrião") : null, p.id === myId ? h("span", { class: "tag you" }, "você") : null),
+        isHost && p.id !== myId ? h("button", { class: "btn-text", style: "padding:4px 6px", onclick: () => act(x => { x.players = x.players.filter(q => q.id !== p.id); }) }, "Tirar") : null)),
+      Array.from({ length: empty }, () => h("div", { class: "empty-seat" }, h("div", { class: "avatar" }), "Lugar livre"))),
+    !me ? h("div", { class: "notice" }, "Você está assistindo. Para jogar, volte ao início e entre com o código antes da partida começar.") : null,
+    isHost
+      ? h("button", { class: "btn btn-primary", disabled: s.players.length < 2 || ui.busy, onclick: () => act(x => { if (x.host !== myId) return "Só o anfitrião começa a partida."; if (x.players.length < 2) return "Precisa de pelo menos 2 jogadores."; startGame(x); }) }, s.players.length < 2 ? "Esperando mais 1 jogador" : "Distribuir as cartas")
+      : h("div", { class: "waiting" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), `Esperando ${nick(s, s.host)} começar`),
+    h("button", { class: "btn btn-ghost", onclick: leaveLobby }, "Sair da mesa"));
+}
+function copyCode() {
+  const txt = code;
+  try { navigator.clipboard.writeText(txt).then(() => toast("Código copiado"), () => toast("Código: " + txt)); } catch (e) { toast("Código: " + txt); }
+}
+
+function stageInfo(s) {
+  const ph = s.phase, me = myId;
+  const you = id => id === me;
+  const nm = id => you(id) ? "Você" : nick(s, id);
+  const o = { eyebrow: "", head: "", detail: "", role: null, chips: null };
+  if (s.status === "over") { o.eyebrow = "Fim de jogo"; o.head = you(s.winner) ? "Você venceu" : `${nick(s, s.winner)} venceu`; return o; }
+  if (ph.k === "turn") {
+    const p = P(s, s.turn);
+    o.eyebrow = "Rodada"; o.head = you(s.turn) ? "Sua vez" : `Vez de ${p.nick}`;
+    o.detail = you(s.turn) ? (p.coins >= 10 ? "Você tem 10 M ou mais: a Aquisição hostil é obrigatória." : "Escolha uma ação. Você pode dizer que é qualquer cargo.") : "Pensando na jogada.";
+    return o;
+  }
+  if (ph.k === "react" || ph.k === "blockReact") {
+    const a = ph.act, A = ACTS[a.type];
+    const tgt = a.target ? (you(a.target) ? "você" : nick(s, a.target)) : "";
+    const effect = { emprestimo: "Empréstimo: +2 M", captar: "Captar: +3 M", tomar: `Tomar 2 M de ${tgt}`, sabotar: `Sabotar ${tgt}`, recrutar: "Recrutar: trocar cartas" }[a.type];
+    if (ph.k === "react" && ph.stage === "action") {
+      o.eyebrow = A.claim ? "Declaração" : "Ação";
+      o.head = A.claim ? `${nm(a.actor)} ${you(a.actor) ? "diz" : "diz"} ser ${ROLES[A.claim].n}` : `${nm(a.actor)} ${you(a.actor) ? "pediu" : "pediu"} Empréstimo`;
+      o.role = A.claim;
+      o.detail = A.claim ? `${effect}. ${A.blockRoles ? "Dá para duvidar ou bloquear." : "Alguém duvida?"}` : "+2 M. Quem disser ser Banqueiro pode bloquear.";
+    } else if (ph.k === "react") {
+      o.eyebrow = "Bloqueio"; o.head = you(a.target) ? "Você pode bloquear" : `${nick(s, a.target)} pode bloquear`;
+      o.detail = `A dúvida não colou. ${effect} segue, a não ser que ${you(a.target) ? "você bloqueie" : "haja bloqueio"}.`;
+    } else {
+      o.eyebrow = "Bloqueio"; o.head = `${nm(ph.blocker)} ${you(ph.blocker) ? "diz" : "diz"} ser ${ROLES[ph.role].n}`; o.role = ph.role;
+      o.detail = `Bloqueando ${A.l} de ${you(a.actor) ? "você" : nick(s, a.actor)}. Alguém duvida?`;
+    }
+    const ids = eligibleIds(s, ph);
+    o.chips = ids.map(id => { const r = s.resp && s.resp[id]; const done = r && r.pid === ph.pid; return { id, name: you(id) ? "você" : nick(s, id), done, txt: done ? ({ pass: "passou", challenge: "duvidou", block: "bloqueou" }[r.r]) : "" }; });
+    return o;
+  }
+  if (ph.k === "lose") { o.eyebrow = "Perda"; o.head = you(ph.who) ? "Entregue uma carta" : `${nick(s, ph.who)} entrega uma carta`; o.detail = you(ph.who) ? "Escolha qual das suas cartas vai ser revelada." : "Escolhendo qual carta revelar."; return o; }
+  if (ph.k === "exchange") { o.eyebrow = "Recrutamento"; o.head = you(ph.who) ? "Monte sua mão" : `${nick(s, ph.who)} está recrutando`; o.detail = you(ph.who) ? "Fique com as cartas que quiser e devolva o resto." : "Trocando cartas com o baralho."; return o; }
+  return o;
+}
+function waitingOn(s) {
+  const ph = s.phase;
+  if (s.status !== "play") return [];
+  if (ph.k === "turn") return [s.turn];
+  if (ph.k === "lose" || ph.k === "exchange") return [ph.who];
+  if (ph.k === "react" || ph.k === "blockReact") return eligibleIds(s, ph).filter(id => !(s.resp && s.resp[id] && s.resp[id].pid === ph.pid));
+  return [];
+}
+function canUnstick(s) { return s.host === myId && s.status === "play" && waitingOn(s).some(id => id !== myId) && Date.now() - (s.at || 0) > 30000; }
+
+function gameView(s) {
+  const me = P(s, myId), info = stageInfo(s);
+  const sf = fxOf("stage", 900);
+  const others = s.players.filter(p => p.id !== myId);
+  const actId = s.phase && s.phase.act ? s.phase.act.actor : null;
+  const exitBtn = h("button", { class: "ibtn", "aria-label": ui.leaveArm ? "Toque de novo para sair" : "Sair da mesa", html: SVG.exit, style: ui.leaveArm ? "color:var(--bad);border-color:var(--bad)" : null,
+    onclick: () => { if (ui.leaveArm) { leaveLocal(); } else { ui.leaveArm = true; toast("Toque de novo para sair da mesa"); render(); setTimeout(() => { ui.leaveArm = false; render(); }, 3000); } } });
+
+  const seats = h("div", { class: "seats" }, others.map(p => {
+    const isTurn = s.status === "play" && (s.turn === p.id);
+    const out = !alive(p);
+    const isTarget = s.phase && s.phase.act && s.phase.act.target === p.id && (s.phase.k === "react" || s.phase.k === "blockReact");
+    let sub = "", hot = false;
+    if (out) sub = "Fora da partida";
+    else if (s.status === "over" && s.winner === p.id) { sub = "Vencedor"; hot = true; }
+    else if (s.phase.k === "lose" && s.phase.who === p.id) { sub = "Escolhendo carta"; hot = true; }
+    else if (s.phase.k === "exchange" && s.phase.who === p.id) { sub = "Recrutando"; hot = true; }
+    else if (s.phase.k === "blockReact" && s.phase.blocker === p.id) { sub = `Bloqueando como ${ROLES[s.phase.role].n}`; hot = true; }
+    else if (isTarget) { sub = "Alvo da jogada"; hot = true; }
+    else if (isTurn) { sub = actId === p.id && s.phase.k !== "turn" ? "Jogou" : "Na vez"; hot = true; }
+    return h("div", { class: "seat" + (isTurn ? " turn" : "") + (out ? " out" : "") },
+      avatarEl(p),
+      h("div", { class: "seat-mid" }, h("div", { class: "seat-name" }, p.nick, p.id === s.host ? h("span", { class: "tag" }, "anfitrião") : null), h("div", { class: "seat-sub" + (hot ? " hot" : "") }, sub)),
+      coinsEl(p),
+      h("div", { class: "seat-cards" }, p.cards.map((c, i) => miniEl(p, c, i))));
+  }));
+
+  const stage = h("div", { class: "stage" + (sf ? " fx-rise" : ""), style: sf ? `animation-delay:${sf.delay}ms` : null, "aria-live": "polite" },
+    h("div", { class: "eyebrow" }, info.eyebrow),
+    h("h2", null, info.head),
+    info.role ? h("div", { class: "role-pill", style: `--rc:${ROLES[info.role].hue}` }, h("i", { html: ICONS[info.role] }), ROLES[info.role].n, " · ", ROLES[info.role].a || ROLES[info.role].b) : null,
+    info.detail ? h("div", { class: "detail" }, info.detail) : null,
+    info.chips && info.chips.length ? h("div", { class: "chips" }, info.chips.map(c => h("span", { class: "chip" + (c.done ? " done" : "") + (c.done && c.txt !== "passou" ? " bad" : "") }, h("span", { class: "d" }), c.name, c.done ? ` · ${c.txt}` : ""))) : null,
+    canUnstick(s) ? h("button", { class: "unstick", onclick: () => act(x => forcePending(x)) }, "Destravar: decidir por quem sumiu") : null);
+
+  const parts = [topBar(exitBtn), seats, stage];
+  if (conn) parts.push(h("div", { class: "notice" }, conn));
+
+  if (me) {
+    const losing = s.phase.k === "lose" && s.phase.who === myId;
+    parts.push(h("div", { class: "hand-head" },
+      h("div", { class: "sect-title" }, h("h3", null, alive(me) ? "Suas cartas" : "Você está fora")),
+      h("div", { class: "hand-head-coins" }, coinsEl(me, true))));
+    parts.push(h("div", { class: "hand", id: "myhand" }, me.cards.map((c, i) => h("div", { class: "slot" },
+      cardEl(c.r, {
+        dead: c.dead, fxKey: `card:${myId}:${i}`, deal: true, dealIdx: i,
+        selectable: losing && !c.dead, sel: losing && ui.loseSel === i,
+        onclick: losing && !c.dead ? () => { ui.loseSel = i; sfx("tap"); render(); } : null,
+      })))));
+    const pnl = panelFor(s, me); pnl.id = "mypanel"; parts.push(pnl);
+  } else {
+    parts.push(h("div", { class: "notice", style: "display:flex;gap:10px;align-items:center" }, h("span", { html: SVG.eye, style: "width:18px;display:grid;flex:none" }), "Você está assistindo esta partida."));
+  }
+  if (s.status === "over") parts.splice(2, 1, winnerView(s));
+
+  const entries = s.log.slice(-8).reverse();
+  parts.push(h("div", { class: "sect-title" }, h("h3", null, "Histórico")));
+  parts.push(h("div", { class: "log" }, entries.map(e => h("div", null, e.m))));
+  return h("div", { class: "wrap" }, parts);
+}
+function panelFor(s, me) {
+  const ph = s.phase;
+  if (s.status === "over") return h("div");
+  if (!alive(me)) return h("div", { class: "waiting" }, "Você saiu desta partida. Dá para acompanhar até o fim.");
+  const waitTxt = t => h("div", { class: "waiting" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), t);
+
+  if (ph.k === "turn" && s.turn === myId) {
+    if (ui.pick) {
+      const A = ACTS[ui.pick];
+      const targets = s.players.filter(p => p.id !== myId && alive(p));
+      return h("div", { class: "btn-row fx-rise" },
+        h("div", { class: "sect-title" }, h("h3", null, `${A.l}: escolha o alvo`)),
+        h("div", { class: "targets" }, targets.map(p => h("button", { class: "target", disabled: ui.busy, onclick: () => go(ui.pick, p.id) },
+          avatarEl(p), h("span", { class: "grow" }, p.nick), coinsEl(p), h("span", { class: "seat-cards" }, p.cards.map((c, i) => miniEl(p, c, i)))))),
+        h("button", { class: "btn btn-ghost", onclick: () => { ui.pick = null; render(); } }, "Voltar"));
+    }
+    const must = me.coins >= 10;
+    const held = new Set(me.cards.filter(c => !c.dead).map(c => c.r));
+    return h("div", { class: "btn-row" },
+      h("div", { class: "sect-title" }, h("h3", null, "Sua jogada")),
+      h("div", { class: "actions" }, ACT_ORDER.map((k, i) => {
+        const A = ACTS[k], R = A.claim ? ROLES[A.claim] : null;
+        const dis = ui.busy || (must && k !== "aquisicao") || (A.cost && me.coins < A.cost);
+        return h("button", { class: "act" + (R ? " role" : "") + (k === "aquisicao" ? " wide" : "") + (must && k === "aquisicao" ? " must" : "") + " fx-rise", style: (R ? `--rc:${R.hue};` : "") + `animation-delay:${i * .04}s`, disabled: dis,
+          onclick: () => { sfx("tap"); if (A.target) { ui.pick = k; render(); } else go(k); } },
+          h("span", { class: "t" }, A.l),
+          h("span", { class: "d" }, A.d),
+          R ? h("span", { class: "who" }, h("span", { class: "dot" }), R.n, held.has(A.claim) ? h("span", { class: "have" }, "na mão") : null) : null);
+      })));
+  }
+  if (ph.k === "turn") return waitTxt(`Esperando ${nick(s, s.turn)} jogar`);
+
+  if (ph.k === "react" || ph.k === "blockReact") {
+    const o = options(s, ph, myId);
+    if (!o) return waitTxt(ph.act.actor === myId ? "Esperando a mesa responder" : "Esperando as respostas");
+    const mine = (s.resp && s.resp[myId] && s.resp[myId].pid === ph.pid) ? s.resp[myId] : (ui.sent && ui.sent.pid === ph.pid ? ui.sent : null);
+    if (mine) return waitTxt({ pass: "Você deixou passar. Esperando os outros", challenge: "Você duvidou", block: "Você bloqueou" }[mine.r]);
+    const claimRole = ph.k === "blockReact" ? ph.role : ACTS[ph.act.type].claim;
+    const held = new Set(me.cards.filter(c => !c.dead).map(c => c.r));
+    return h("div", { class: "btn-row fx-rise" },
+      o.challenge ? h("button", { class: "btn btn-bad", onclick: () => respond("challenge") }, `Duvidar: não é ${ROLES[claimRole].n}`) : null,
+      o.blocks.map(r => h("button", { class: "btn btn-role", style: `--rc:${ROLES[r].hue}`, onclick: () => respond("block", r) }, h("span", { class: "dot" }), `Bloquear como ${ROLES[r].n}`, held.has(r) ? h("span", { style: "color:var(--good);font-size:12px" }, "na mão") : null)),
+      h("button", { class: "btn btn-primary", onclick: () => respond("pass") }, "Deixar passar"));
+  }
+  if (ph.k === "lose") {
+    if (ph.who !== myId) return waitTxt(`Esperando ${nick(s, ph.who)} escolher`);
+    const sel = ui.loseSel != null && me.cards[ui.loseSel] && !me.cards[ui.loseSel].dead ? ui.loseSel : null;
+    return h("div", { class: "btn-row" },
+      h("button", { class: "btn btn-bad", disabled: sel == null || ui.busy, onclick: () => act(x => chooseLose(x, myId, sel)) }, sel == null ? "Toque na carta que vai entregar" : `Entregar ${ROLES[me.cards[sel].r].n}`));
+  }
+  if (ph.k === "exchange") {
+    if (ph.who !== myId) return waitTxt(`Esperando ${nick(s, ph.who)} recrutar`);
+    const slots = liveIdx(me), pool = slots.map(i => me.cards[i].r).concat(ph.drawn), need = slots.length;
+    const sel = ui.exSel.filter(i => i < pool.length);
+    return h("div", { class: "btn-row fx-rise" },
+      h("div", { class: "sect-title" }, h("h3", null, `Fique com ${need} carta${need > 1 ? "s" : ""}`), h("span", { class: "mute num", style: "font-size:13px" }, `${sel.length} de ${need}`)),
+      h("div", { class: "pool" }, pool.map((r, i) => h("div", null,
+        cardEl(r, { selectable: true, sel: sel.includes(i), onclick: () => {
+          const at = ui.exSel.indexOf(i);
+          if (at >= 0) ui.exSel.splice(at, 1); else { if (ui.exSel.length >= need) ui.exSel.shift(); ui.exSel.push(i); }
+          sfx("tap"); render();
+        } }),
+        h("div", { class: "lbl" }, i < slots.length ? "sua" : "nova")))),
+      h("button", { class: "btn btn-primary", disabled: sel.length !== need || ui.busy, onclick: () => act(x => chooseExchange(x, myId, sel)) }, "Ficar com estas"));
+  }
+  return h("div");
+}
+function winnerView(s) {
+  const isHost = s.host === myId;
+  return h("div", { class: "stage winner" },
+    h("div", { class: "crown", html: SVG.crown }),
+    h("div", { class: "eyebrow" }, "Fim de jogo"),
+    h("h2", null, s.winner === myId ? "Você venceu" : `${nick(s, s.winner)} venceu`),
+    h("div", { class: "rule" }),
+    h("div", { class: "detail" }, s.winner === myId ? "Blefou bem, duvidou melhor. A mesa é sua." : "Último com cartas na mão."),
+    isHost ? h("div", { class: "btn-row", style: "width:100%;margin-top:8px" },
+      h("button", { class: "btn btn-primary", disabled: ui.busy, onclick: () => act(x => { if (x.players.length < 2) return "Precisa de 2 jogadores."; startGame(x); }) }, "Jogar de novo"),
+      h("button", { class: "btn btn-ghost", disabled: ui.busy, onclick: () => act(x => { x.status = "lobby"; x.phase = { k: "lobby", pid: newPid() }; x.resp = {}; x.players.forEach(p => { p.cards = []; p.coins = 0; }); }) }, "Abrir a mesa para mais gente"))
+      : h("div", { class: "waiting" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), `${nick(s, s.host)} decide a próxima`));
+}
+function rulesView() {
+  const close = () => { ui.rules = false; render(); };
+  return h("div", { class: "sheet", onclick: e => { if (e.target.classList.contains("sheet")) close(); } },
+    h("div", { class: "body" },
+      h("div", { class: "top" }, h("div", { class: "eyebrow" }, "Manual da mesa"), h("button", { class: "ibtn", "aria-label": "Fechar", onclick: close, html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>' })),
+      h("h2", null, "Como jogar"),
+      h("p", null, "Ganha quem ficar por último com carta na mão. Cada um começa com ", h("b", null, "2 cartas secretas"), " e ", h("b", null, "2 M"), ". Com 2 jogadores, quem abre começa com 1 M."),
+      h("p", null, "Na sua vez, faça uma ação. Você pode dizer que é ", h("b", null, "qualquer cargo"), ", tendo a carta ou não. O baralho tem 3 cartas de cada cargo."),
+      h("h4", null, "Os cinco cargos"),
+      h("div", { class: "rgrid" }, ROLE_ORDER.map(r => h("div", { class: "rrow" }, cardEl(r), h("div", null, h("b", null, ROLES[r].n), ROLES[r].a ? h("span", null, ROLES[r].a) : null, ROLES[r].b ? h("span", null, ROLES[r].b) : null)))),
+      h("h4", null, "Ações de qualquer um"),
+      h("ul", null,
+        h("li", null, h("b", null, "Salário:"), " +1 M. Ninguém bloqueia."),
+        h("li", null, h("b", null, "Empréstimo:"), " +2 M. Qualquer um pode bloquear dizendo ser Banqueiro."),
+        h("li", null, h("b", null, "Aquisição hostil:"), " paga 7 M e o alvo perde uma carta. Ninguém bloqueia. Com 10 M ou mais, ela é obrigatória.")),
+      h("h4", null, "Duvidar"),
+      h("p", null, "Quando alguém diz ser um cargo (na ação ou no bloqueio), qualquer um pode duvidar. Se a pessoa tinha a carta, ela mostra, troca por outra do baralho e ", h("b", null, "quem duvidou perde uma carta"), ". Se blefou, ", h("b", null, "ela perde uma carta"), " e a jogada não acontece."),
+      h("h4", null, "Bloquear"),
+      h("p", null, "Quem é alvo de Tomar pode bloquear como Tubarão ou Headhunter. Quem é alvo de Sabotar pode bloquear como Jurídico. O bloqueio também é uma declaração, então pode ser duvidado."),
+      h("h4", null, "Detalhes"),
+      h("ul", null,
+        h("li", null, "Quem perde uma carta escolhe qual revelar. Sem cartas, está fora."),
+        h("li", null, "Os 3 M do Sabotar são pagos na hora. Voltam só se provarem que você blefou."),
+        h("li", null, "Mesmo depois de uma dúvida que não colou, o alvo ainda pode bloquear."),
+        h("li", null, "Se alguém sumir, o anfitrião pode destravar a mesa depois de 30 segundos.")),
+      h("button", { class: "btn btn-primary", onclick: close }, "Bora jogar")));
+}
+
+/* =================== ações do jogador =================== */
+function go(type, target) { ui.pick = null; act(x => declare(x, myId, type, target)); }
+async function respond(r, role) {
+  const ph = state.phase;
+  ui.sent = { pid: ph.pid, r, role: role || null, t: Date.now() };
+  sfx("tap"); render();
+  try { await gameRef.update({ resp: { [myId]: ui.sent } }); }
+  catch (e) { ui.sent = null; toast(errMsg(e)); render(); }
+}
+function envProblem() {
+  if (env === "ok") return null;
+  if (env === "loading") return "Ainda conectando ao jogo. Espere 2 segundos e toque de novo.";
+  if (env === "noid") return "Entre na sua conta do Claude para jogar.";
+  return "Aqui o modo online não funciona. Abra o link no Safari ou no Chrome, logado na sua conta do Claude.";
+}
+function nickOk() {
+  const ep = envProblem(); if (ep) { toast(ep); return null; }
+  const n = (ui.nick || "").trim();
+  if (n.length < 2) { toast("Escreva um apelido com pelo menos 2 letras."); const el = document.getElementById("nick"); el && el.focus(); return null; }
+  return n.slice(0, 16);
+}
+async function createTable() {
+  const n = nickOk(); if (!n) return;
+  ui.busy = true; render();
+  const L = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  try {
+    for (let i = 0; i < 6; i++) {
+      const c = Array.from({ length: 4 }, () => L[Math.floor(Math.random() * L.length)]).join("");
+      const ref = db.doc("mesas/" + c);
+      const ex = await ref.get();
+      if (ex.exists && Date.now() - (ex.data().at || 0) < 12 * 3600e3) continue;
+      await ref.set({ v: 1, at: Date.now(), code: c, host: myId, status: "lobby", round: 0, players: [{ id: myId, nick: n, coins: 0, cards: [] }], deck: [], turn: null, phase: { k: "lobby", pid: newPid() }, resp: {}, log: [], logN: 0, winner: null });
+      ui.busy = false; watch(c); return;
+    }
+    toast("Não deu para criar a mesa. Tente de novo.");
+  } catch (e) { toast(errMsg(e)); }
+  ui.busy = false; render();
+}
+async function joinTable(c) {
+  c = (c || "").toUpperCase().replace(/[^A-Z]/g, "");
+  const n = nickOk(); if (!n) return;
+  if (c.length !== 4) { toast("O código tem 4 letras."); const el = document.getElementById("codein"); el && el.focus(); return; }
+  ui.busy = true; render();
+  let snap;
+  try { snap = await db.doc("mesas/" + c).get(); } catch (e) { ui.busy = false; toast(errMsg(e)); render(); return; }
+  ui.busy = false;
+  if (!snap.exists) { toast("Mesa não encontrada. Confira o código."); render(); return; }
+  const d = snap.data(), inIt = d.players.some(p => p.id === myId);
+  if (!inIt && d.status === "lobby" && d.players.length >= 6) { toast("Mesa cheia: já tem 6 jogadores."); render(); return; }
+  watch(c);
+  if (!inIt && d.status !== "lobby") { toast("A partida já começou. Você vai assistir."); return; }
+  await act(x => {
+    const me = P(x, myId);
+    if (me) { if (x.status === "lobby" && me.nick !== n) { me.nick = n; return; } return "noop"; }
+    if (x.status !== "lobby") return "A partida já começou.";
+    if (x.players.length >= 6) return "Mesa cheia.";
+    x.players.push({ id: myId, nick: n, coins: 0, cards: [] });
+  });
+}
+async function leaveLobby() {
+  if (state && state.status === "lobby" && P(state, myId)) {
+    await commit(x => {
+      x.players = x.players.filter(p => p.id !== myId);
+      if (x.host === myId && x.players[0]) x.host = x.players[0].id;
+    }, true);
+  }
+  leaveLocal();
+}
+
+/* =================== início =================== */
+let lastUnstick = false;
+setInterval(() => { if (state && state.status === "play") { const u = canUnstick(state); if (u !== lastUnstick) { lastUnstick = u; render(); } } }, 3000);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && ui.rules) { ui.rules = false; render(); } });
+
+async function boot() {
+  render();
+  const cl = window.claude;
+  if (!cl || !cl.use) { env = "offline"; render(); return; }
+  [db, user] = await Promise.all([cl.use("db"), cl.use("user")]);
+  if (!db || !user) { env = "offline"; render(); return; }
+  myId = await user.id();
+  if (!myId) { env = "noid"; render(); return; }
+  try { canWrite = await user.can("data.write"); } catch (e) { canWrite = null; }
+  env = "ok";
+  const saved = store.get("blefe.mesa", null);
+  if (saved && /^[A-Z]{4}$/.test(saved)) watch(saved); else render();
+}
+boot();
+</script>
+</body></html>
